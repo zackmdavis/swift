@@ -25,13 +25,13 @@ import operator
 import os
 import pwd
 import re
-import rfc822
 import sys
 import threading as stdlib_threading
 import time
 import uuid
 import functools
 import weakref
+from email.message import Message
 from hashlib import md5, sha1
 from random import random, shuffle
 from urllib import quote as _quote
@@ -3350,6 +3350,18 @@ class _MultipartMimeFileLikeObject(object):
         else:  # no newlines, just return up to next boundary
             return self.read(len(self.input_buffer))
 
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.no_more_data_for_this_file:
+            raise StopIteration
+        else:
+            return self.readline()
+
+    def next(self):  # for Python 2
+        return self.__next__()
+
 
 def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     """
@@ -3384,6 +3396,43 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
         input_buffer = it.input_buffer
 
 
+# Header names may contain printable ASCII characters except for ' ' and ':',
+# as per RFC 2822 section 3.6.8, "Optional fields".
+MIME_HEADER_RE = re.compile(r'^([\x21-\x39\x3b-\x7e]+:|[\t ])')
+
+
+def headers_from_mime_doc_file(doc_file):
+    """
+    Takes a file-like object containing a MIME document and returns an
+    email.message.Message object containing the headers. The body of the
+    message is not consumed: the position in doc_file is left at the beginning
+    of the body. The header-parsing is heavily inspired by code in
+    email.feedparser, with simplifications. (The email package does not seem to
+    expose a method to get headers without consuming the body.)
+
+    :param doc_file: file-like object containing a MIME document
+    :returns: an email.message.Message object containing the headers
+    """
+    headers = Message()
+
+    current_header = current_value = ''
+    for line in doc_file:
+        if not MIME_HEADER_RE.match(line):
+            break  # end of headers
+
+        if line[0] in ' \t':  # folding whitespace continuation
+            current_value += line.lstrip()
+        else:
+            if current_header:
+                headers[current_header] = current_value
+            current_header, current_value = line.split(':', 1)
+            current_value = current_value.strip()  # cut space after colon
+    if current_header:  # last one
+        headers[current_header] = current_value
+
+    return headers
+
+
 def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
     """
     Takes a file-like object containing a multipart MIME document and
@@ -3398,7 +3447,7 @@ def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
                                               read_chunk_size)
     for i, doc_file in enumerate(doc_files):
         # this consumes the headers and leaves just the body in doc_file
-        headers = rfc822.Message(doc_file, 0)
+        headers = headers_from_mime_doc_file(doc_file)
         yield (headers, doc_file)
 
 
@@ -3513,7 +3562,7 @@ def multipart_byteranges_to_document_iters(input_file, boundary,
     for headers, body in mime_to_document_iters(input_file, boundary,
                                                 read_chunk_size):
         first_byte, last_byte, length = parse_content_range(
-            headers.getheader('content-range'))
+            headers.get('content-range'))
         yield (first_byte, last_byte, length, headers.items(), body)
 
 
